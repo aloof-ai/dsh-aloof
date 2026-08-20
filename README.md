@@ -1,10 +1,12 @@
 # dsh-aloof
 
-把 [Aloof](https://github.com/aloof-ai/aloof)（企业团队知识协同平台）接成 DeepSeek Harness（dsh）的原生工具。
+把 Aloof（企业团队知识协同平台）接成 DeepSeek Harness（dsh）的原生工具。
 
 装上之后，你在 dsh 里问「Aloof 连上了吗」「我在哪几台机器上接了」这类话，模型能自己去查。
 
 **这一版只做「连上」这件事**——两个只读工具，用来确认这台机器真的接到了公司那台 Aloof 上、而且 Aloof 那边认出了你是谁。团队资料库的读写工具跟着资料库那一期一起来。
+
+> **先说清楚：这是个客户端插件，得配一台 Aloof 才有用。** Aloof 是私有部署的企业平台，服务端不在这个仓库、也不公开。手上没有 Aloof 实例的话，装上这个插件只会得到一句「没配 ALOOF_TOKEN」——它不是能独立干活的工具集。
 
 ## 要什么
 
@@ -14,12 +16,15 @@
 
 ## 装
 
-还没发到 npm（`package.json` 里 `private: true` 是故意的，防手滑发布），先用本地装法：
+```sh
+dsh plugin --profile web add dsh-aloof
+```
 
-```bash
+想跟着改代码就用本地开发链接：
+
+```sh
 git clone https://github.com/aloof-ai/dsh-aloof.git
-cd dsh-aloof && npm link
-# 然后在你的 dsh profile 里 link 进来
+dsh plugin --profile web add /绝对路径/dsh-aloof
 ```
 
 ## 配
@@ -32,13 +37,15 @@ cd dsh-aloof && npm link
 alf_xxxxxxxxxxxx@https://aloof.你们公司
 ```
 
-**整串**放进环境变量 `ALOOF_TOKEN`，或者写进 `$DSH_HOME/.credentials.yaml`。
+**整串**放进环境变量 `ALOOF_TOKEN`，或者写进 `$DSH_HOME/.credentials.yaml`：
+
+```yaml
+ALOOF_TOKEN: alf_xxxxxxxxxxxx@https://aloof.你们公司
+```
 
 地址是跟着票一起来的，所以**不用再配服务器地址**。这不是为了少打几个字：地址和票如果是两个各自可填的字段，「填串了、把票发到别人服务器上」这件事就永远可能发生；粘在一起之后它在物理上就不成立了。
 
 注意别只粘前半截——`@` 后面那截就是地址，少了它插件不知道该往哪儿发（真发生了会有一句明确的报错告诉你去重新复制）。
-
-> 反向代理、内网另有入口这类情况下，网页上的地址和 dsh 能到达的地址可能确实不是同一个。那时可以在 cordis 配置里填 `baseUrl` 手动覆盖，填了以它为准。平常留空。
 
 **放的必须是接入令牌，不是网页的登录票。** 登录票带着这个人的全部权限、而且没法单独作废；接入令牌读全放行、写只走白名单，并且能按设备单独吊销——某台机器丢了，在网页上把那一张吊掉就行，不影响你其他机器。
 
@@ -51,8 +58,30 @@ alf_xxxxxxxxxxxx@https://aloof.你们公司
 
 **发新票和吊销都只能在网页上做**，这里故意没有对应的工具——不能让模型给自己续期或者增发。
 
+## 可选配置
+
+平常一行都不用写。真需要时在 cordis 配置里给：
+
+| 键 | 默认 | 什么时候动它 |
+|---|---|---|
+| `tokenEnv` | `ALOOF_TOKEN` | 一台机器上要接两套 Aloof，各用一个凭据名 |
+| `timeoutMs` | `20000` | 服务端在很慢的网络后面 |
+| `baseUrl` | 空（跟着票走） | 反向代理、内网另有入口，网页地址和 dsh 能到达的地址不是同一个。填了以它为准 |
+
+## 连不上的时候
+
+报错都是照着「哪一种问题」写的，直接照做：
+
+| 看到 | 意思 |
+|---|---|
+| `没配 ALOOF_TOKEN` | 票没放进环境变量，也没写进 `.credentials.yaml` |
+| `…那串票不带地址` | 只粘了 `@` 前面那半截，回网页重新整串复制 |
+| `连不上 Aloof（…）` | 地址通不了：服务没起、端口不对、或者不在同一个网里 |
+| `Aloof 401` | 票不对、或者已经在网页上被吊销了 |
+| `Aloof 403` | 票是好的，但这个接口对接入令牌关着（写操作默认关闭） |
+
 ## 跟服务端的关系
 
-插件调的是 Aloof 的 HTTP 接口，两边是**锁步演进**的：服务端接口一改，这里可能要跟着改。服务端在 [aloof-ai/aloof](https://github.com/aloof-ai/aloof)，接口契约看那边的 `server/openapi.json`。
+插件调的是 Aloof 的 HTTP 接口，两边是**锁步演进**的：服务端接口一改，这里可能要跟着改。服务端接口契约以那边导出的 `openapi.json` 为准。
 
-改这个仓库之前建议先看服务端仓库根上的 `AGENTS.md`，尤其是「令牌自带地址」和「写操作默认关闭」这两条约定的理由——它们是有意为之，不是没做完。
+这个插件整份 `index.js` 里没有一句 `import`，是故意的：`defineTool` 这些都在 `@deepseek-ai/dsh-*` 包里，用了就把插件钉死在某个 dsh 内部版本上，而且插件被软链进 profile 时 Node 会从**真实路径**往上找 `node_modules`、找不到那些包。所以这里直接手写 JSON Schema、只用 `ctx` 上的服务。对一个只做 HTTP 转发的薄壳来说，代价只是少了编译期类型推导。

@@ -1,16 +1,24 @@
 {
   "name": "dsh-aloof",
-  "version": "0.1.0",
-  "private": true,
-  "description": "把 Aloof（企业团队知识协同平台）接成 DeepSeek Harness 的原生工具。这一版只做连通性确认，资料库工具随资料库那一期一起来。",
+  "version": "0.2.0",
+  "description": "把 Aloof（企业团队知识协同平台）接成 DeepSeek Harness 的原生工具：两个只读工具，确认这台 dsh 连到了哪台 Aloof、被认成谁，以及自己名下有哪些接入令牌。",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
+    "cordis",
     "aloof"
   ],
   "license": "MIT",
   "author": "Aloof",
+  "homepage": "https://github.com/aloof-ai/dsh-aloof#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aloof-ai/dsh-aloof.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aloof-ai/dsh-aloof/issues"
+  },
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -20,7 +28,9 @@
   },
   "files": [
     "index.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
@@ -29,5 +39,8 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
