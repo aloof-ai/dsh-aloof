@@ -1,9 +1,17 @@
 /**
  * 浏览器半部：dsh 界面右下角那颗常驻的 Aloof 按钮。
  *
- * 折叠态就是一颗带 logo 的圆钮 + 一个红绿灯，点开是一张卡：连的哪台、认出你是谁、用的哪张票，
- * 连不上时把报错和排查顺序一起摆出来。它和 `/aloof` 命令读的是**同一个** `status()`
- * （经 `GET /dsh-aloof/status`），所以两处口径不会分叉。
+ * 折叠态就是一颗带 logo 的圆钮 + 一个红绿灯，**可以拖到顺手的地方**（位置记在 localStorage，
+ * 卡片朝屏幕中间开）。点开是一张卡，两段：
+ *
+ * - **状态**：连的哪台、认出你是谁、用的哪张票；连不上时把报错和排查顺序一起摆出来。和
+ *   `/aloof` 命令读的是**同一个** `status()`（经 `GET /dsh-aloof/status`），两处口径不会分叉。
+ * - **凭据**：这张票叫什么、**从哪来**（文件还是启动环境变量）、换票、清票。值从不显示也不
+ *   取回浏览器，输入框是 password 且每次都是空的——跟 dsh 自己的模型设置页一个规矩。
+ *
+ * 凭据的读写走宿主的 `/api` RPC（`connection.api.credentials`），**不是**自己注册的路由：
+ * `webServer.register` 上没有 CSRF / Origin 检查，而 dsh 听在 127.0.0.1，自开一条写路由等于
+ * 让任何网页都能改你的票。理由详见 `apply` 里那段注释。
  *
  * ── 为什么这个文件是手写的产物、而不是编译出来的 ──────────────────────────
  *
@@ -38,6 +46,49 @@ window.__ModuleLoader__.load({
     /** 没人操作时的复查间隔。票是会在别处失效的（被吊销、改密连带、过期），红绿灯得自己变。 */
     const POLL_MS = 30_000
 
+    /** 拖到哪儿了，记在这个键下。换机器不跟着走——它是「这块屏幕上顺手的位置」，不是设置。 */
+    const POS_KEY = 'dsh-aloof:fab-pos'
+
+    /**
+     * 按下到抬起之间挪动不超过这么多像素，算点击而不算拖拽。
+     *
+     * 不设这个阈值的话，任何一次点击都会因为手指的轻微位移被判成拖拽，于是面板永远打不开
+     * ——这是可拖拽按钮最典型的坏法。
+     */
+    const DRAG_SLOP = 4
+
+    /** 按钮直径，和 CSS 里的 46 对齐；用来把按钮夹在可视区内。 */
+    const FAB_SIZE = 46
+
+    /** 夹边留白：贴边但不贴死，也保证按钮不会被拖出去点不着。 */
+    const EDGE = 8
+
+    /**
+     * 拖拽结束后这么久之内的 click 当成拖拽的尾巴丢掉。
+     *
+     * 松手和浏览器补发 click 之间只隔一帧，300ms 足够宽；同时又短到「拖完马上想点开」不会
+     * 被挡（人从松手到再点，比这慢得多）。
+     */
+    const CLICK_GRACE = 300
+
+    /** 默认落在右下角。 */
+    const HOME = { right: 18, bottom: 18 }
+
+    /**
+     * `describe()` 给的来源名换成人话。**这是这张卡最要紧的一句信息。**
+     *
+     * dsh 的取值优先级是「进程环境变量 > `.credentials.yaml` > 各种 .env」，其中环境变量那层
+     * **启动时冻结、且压在文件之上**。所以「环境变量里有一份」的时候，在这张卡上改票会写进
+     * 文件、`set()` 甚至直接报错，而人看到的现象是「改了没反应」——和「插件缓存了票」一模一样。
+     * 已经为这个误判查过一轮，所以来源必须直接摆在界面上，而不是等人自己想到。
+     */
+    const SOURCES = {
+      env: '启动 dsh 时的环境变量',
+      file: '.credentials.yaml',
+      'project-env': '项目目录的 .env',
+      'user-env': '$DSH_HOME/.env',
+    }
+
     /**
      * 公司 logo 的两条路径，坐标系 `viewBox 0 0 100 100`。**别手改。**
      * 和 Aloof 网页、favicon 用的是同一份成品（`aloof/web/src/logo-paths.ts`）。
@@ -54,16 +105,20 @@ window.__ModuleLoader__.load({
      * 标记），所以插件被卸掉之后不会留下孤儿样式。存在性检查让重复执行是幂等的。
      */
     const CSS = `
-.aloof-fab{position:absolute;right:18px;bottom:18px;display:flex;flex-direction:column;align-items:flex-end;gap:10px;font:13px/1.5 var(--dsw-font-family,system-ui,-apple-system,"Segoe UI",sans-serif)}
-.aloof-fab-btn{position:relative;width:46px;height:46px;border:0;border-radius:50%;padding:0;cursor:pointer;background:var(--dsw-alias-bg-inverse,#1d1d1f);box-shadow:0 6px 20px rgba(0,0,0,.22);transition:transform .18s ease,box-shadow .18s ease;display:grid;place-items:center}
+.aloof-fab{position:absolute;display:flex;flex-direction:column;align-items:flex-end;gap:10px;font:13px/1.5 var(--dsw-font-family,system-ui,-apple-system,"Segoe UI",sans-serif);touch-action:none}
+.aloof-fab[data-below="yes"]{flex-direction:column-reverse}
+.aloof-fab[data-side="left"]{align-items:flex-start}
+.aloof-fab-btn{position:relative;width:46px;height:46px;border:0;border-radius:50%;padding:0;cursor:grab;background:var(--dsw-alias-bg-inverse,#1d1d1f);box-shadow:0 6px 20px rgba(0,0,0,.22);transition:transform .18s ease,box-shadow .18s ease;display:grid;place-items:center}
 .aloof-fab-btn:hover{transform:translateY(-2px) scale(1.05);box-shadow:0 10px 26px rgba(0,0,0,.28)}
 .aloof-fab-btn:active{transform:translateY(0) scale(.97)}
+/* 拖着的时候不要 hover/active 那套：位置每帧在变，再叠一个 .18s 的补间会拖成橡皮筋。 */
+.aloof-fab-btn[data-dragging="yes"],.aloof-fab-btn[data-dragging="yes"]:hover,.aloof-fab-btn[data-dragging="yes"]:active{cursor:grabbing;transition:none;transform:scale(1.08);box-shadow:0 14px 30px rgba(0,0,0,.3)}
 .aloof-fab-dot{position:absolute;right:-1px;bottom:-1px;width:13px;height:13px;border-radius:50%;border:2.5px solid var(--dsw-alias-bg-primary,#fff)}
 .aloof-fab-dot[data-live="yes"]{background:#22c55e;animation:aloof-fab-breathe 2.4s ease-in-out infinite}
 .aloof-fab-dot[data-live="no"]{background:#ef4444}
 .aloof-fab-dot[data-live="wait"]{background:#9ca3af;animation:aloof-fab-breathe 1.1s ease-in-out infinite}
 @keyframes aloof-fab-breathe{0%,100%{opacity:1}50%{opacity:.45}}
-.aloof-fab-card{width:290px;padding:14px 15px;border-radius:14px;background:var(--dsw-alias-bg-elevated,var(--dsw-alias-bg-primary,#fff));color:var(--dsw-alias-label-primary,#1d1d1f);border:1px solid var(--dsw-alias-border-primary,rgba(0,0,0,.09));box-shadow:0 12px 34px rgba(0,0,0,.16);animation:aloof-fab-rise .16s ease-out}
+.aloof-fab-card{width:290px;box-sizing:border-box;padding:14px 15px;border-radius:14px;background:var(--dsw-alias-bg-elevated,var(--dsw-alias-bg-primary,#fff));color:var(--dsw-alias-label-primary,#1d1d1f);border:1px solid var(--dsw-alias-border-primary,rgba(0,0,0,.09));box-shadow:0 12px 34px rgba(0,0,0,.16);animation:aloof-fab-rise .16s ease-out}
 @keyframes aloof-fab-rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .aloof-fab-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px;font-weight:600}
 .aloof-fab-row{display:flex;gap:8px;padding:3px 0}
@@ -72,6 +127,19 @@ window.__ModuleLoader__.load({
 .aloof-fab-why{margin-top:10px;padding-top:10px;border-top:1px solid var(--dsw-alias-border-primary,rgba(0,0,0,.09));color:var(--dsw-alias-label-secondary,#6b7280)}
 .aloof-fab-recheck{border:0;background:none;padding:0;cursor:pointer;color:var(--dsw-alias-label-secondary,#6b7280);font:inherit;text-decoration:underline}
 .aloof-fab-recheck:hover{color:var(--dsw-alias-label-primary,#1d1d1f)}
+.aloof-fab-sec{margin-top:12px;padding-top:10px;border-top:1px solid var(--dsw-alias-border-primary,rgba(0,0,0,.09))}
+.aloof-fab-sec-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:8px;font-weight:600}
+.aloof-fab-src{font-weight:400;font-size:12px;color:var(--dsw-alias-label-secondary,#6b7280)}
+.aloof-fab-input{width:100%;box-sizing:border-box;padding:6px 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-primary,rgba(0,0,0,.14));background:var(--dsw-alias-bg-primary,#fff);color:inherit;font:inherit}
+.aloof-fab-input:focus{outline:none;border-color:var(--dsw-alias-label-primary,#1d1d1f)}
+.aloof-fab-input:disabled{opacity:.55;cursor:not-allowed}
+.aloof-fab-acts{display:flex;gap:6px;margin-top:8px}
+.aloof-fab-go{flex:1;padding:6px 10px;border:0;border-radius:8px;cursor:pointer;font:inherit;background:var(--dsw-alias-bg-inverse,#1d1d1f);color:var(--dsw-alias-label-inverse,#fff)}
+.aloof-fab-ghost{padding:6px 10px;border:1px solid var(--dsw-alias-border-primary,rgba(0,0,0,.14));border-radius:8px;background:none;color:inherit;cursor:pointer;font:inherit}
+.aloof-fab-go:disabled,.aloof-fab-ghost:disabled{opacity:.45;cursor:not-allowed}
+.aloof-fab-note{margin-top:8px;font-size:12px;color:var(--dsw-alias-label-secondary,#6b7280)}
+.aloof-fab-bad{margin-top:8px;font-size:12px;color:#ef4444}
+.aloof-fab-ok{margin-top:8px;font-size:12px;color:#16a34a}
 `
 
     if (typeof document !== 'undefined'
@@ -117,11 +185,246 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * 读存下来的位置。**坏数据一律当没存过**：这颗按钮不值得为了一条脏记录就不出现，
+     * 而「回到右下角」是任何情况下都说得通的兜底。
+     */
+    function loadPos() {
+      try {
+        const raw = window.localStorage.getItem(POS_KEY)
+        if (raw === null) return HOME
+        const saved = JSON.parse(raw)
+        if (typeof saved?.right !== 'number' || typeof saved?.bottom !== 'number') return HOME
+        if (!Number.isFinite(saved.right) || !Number.isFinite(saved.bottom)) return HOME
+        return { right: saved.right, bottom: saved.bottom }
+      } catch {
+        // 隐私模式 / 存储被禁：不存位置就是了，别让它影响按钮本身。
+        return HOME
+      }
+    }
+
+    function savePos(pos) {
+      try {
+        window.localStorage.setItem(POS_KEY, JSON.stringify(pos))
+      } catch {
+        /* 同上：存不下不是错误 */
+      }
+    }
+
+    /**
+     * 把位置夹回可视区。
+     *
+     * 需要它的场合不只是拖拽当时：**窗口被缩小之后**，原先记下的位置可能已经落在视口外，
+     * 那样按钮就永久消失了（还带着「上次明明在的」的困惑）。所以渲染时也夹一次。
+     */
+    function clampPos(pos) {
+      const maxRight = Math.max(EDGE, window.innerWidth - FAB_SIZE - EDGE)
+      const maxBottom = Math.max(EDGE, window.innerHeight - FAB_SIZE - EDGE)
+      return {
+        right: Math.min(Math.max(pos.right, EDGE), maxRight),
+        bottom: Math.min(Math.max(pos.bottom, EDGE), maxBottom),
+      }
+    }
+
+    /**
+     * 拖拽。用 Pointer Events 而不是 mouse：一套代码同时管鼠标、触屏和手写笔，
+     * 且 `setPointerCapture` 让指针滑出按钮之后事件仍然回到这里（拖快了必然滑出）。
+     *
+     * **同一次按下既可能是拖也可能是点。** 「点」仍然由 click 事件负责（鼠标、触屏 tap、
+     * 键盘 Enter/Space 都会产生它，是兼容面最宽的那个入口），这里只负责把**拖拽尾随的那次
+     * click** 滤掉——`recentlyDragged()` 就是给它用的。
+     *
+     * 用时间窗而不是一次性标记，是踩过的：标记要靠「紧跟的那次 click」来消费，可拖快了指针
+     * 会离开按钮，那次 click 就打在公共祖先上、标记没人消费一直留着，于是**下一次真正的点击
+     * 被白白吞掉**，表现是「按钮点不开了」。时间窗会自己过期，不留悬空状态。
+     */
+    function useDrag(pos, setPos) {
+      const from = React.useRef(null)
+      const [dragging, setDragging] = React.useState(false)
+      /** 上一次拖拽结束的时刻。0 = 还没拖过。 */
+      const endedAt = React.useRef(0)
+
+      const onPointerDown = React.useCallback((event) => {
+        // 只接左键；右键要留给浏览器菜单，中键粘贴之类也别抢。
+        if (event.button !== 0) return
+        from.current = { x: event.clientX, y: event.clientY, ...pos, moved: false }
+        // 拖到按钮外面时事件还得回到这儿。**这一句可能抛**（pointerId 已经没了之类），
+        // 而它只是「拖得更顺」的增强：真抛了也要让上面记好的起点继续有效，所以吞掉。
+        try {
+          event.currentTarget.setPointerCapture?.(event.pointerId)
+        } catch {
+          /* 没捕获也能拖，只是指针滑出按钮后可能断 */
+        }
+      }, [pos])
+
+      const onPointerMove = React.useCallback((event) => {
+        const start = from.current
+        if (start === null) return
+        const dx = event.clientX - start.x
+        const dy = event.clientY - start.y
+        if (!start.moved && Math.abs(dx) < DRAG_SLOP && Math.abs(dy) < DRAG_SLOP) return
+        if (!start.moved) {
+          start.moved = true
+          setDragging(true)
+        }
+        // right/bottom 是「离右下角多远」，所以往右下拖 = 这两个数变小，符号是反的。
+        setPos(clampPos({ right: start.right - dx, bottom: start.bottom - dy }))
+      }, [setPos])
+
+      const onPointerUp = React.useCallback(() => {
+        const start = from.current
+        from.current = null
+        // 没超过阈值 = 这是一次点击，什么都不用做：随后的 click 会去开卡片。
+        if (start === null || !start.moved) return
+        setDragging(false)
+        endedAt.current = Date.now()
+        // 位置只在放手时落盘。拖动过程中每帧写一次 localStorage 是同步 IO，会顿。
+        setPos((current) => {
+          savePos(current)
+          return current
+        })
+      }, [setPos])
+
+      /** 刚刚拖过吗——用来判断这次 click 是不是拖拽的尾巴。 */
+      const recentlyDragged = React.useCallback(() => Date.now() - endedAt.current < CLICK_GRACE, [])
+
+      return { dragging, recentlyDragged, handlers: { onPointerDown, onPointerMove, onPointerUp } }
+    }
+
+    /**
+     * 凭据一栏：这张票叫什么、从哪来、能不能在这儿改，以及换票 / 清票。
+     *
+     * **值从来不显示、也不从宿主取回来。** 输入框是 password 且每次打开都是空的，已配置只用
+     * 占位符提示——这跟 dsh 自己的模型设置页一个规矩。想认出「是哪一张」看前缀（`alf_` + 6 位，
+     * 和 Aloof 网页票列表上显示的同一串）就够了。
+     *
+     * @param {{api:any, tokenRef:string, prefix:string|null, onChanged:() => void}} props
+     */
+    function Credentials(props) {
+      const { api, tokenRef, prefix, onChanged } = props
+      const [info, setInfo] = React.useState(null)
+      const [draft, setDraft] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [failed, setFailed] = React.useState(null)
+      const [done, setDone] = React.useState(null)
+
+      const describe = React.useCallback(async () => {
+        try {
+          const res = await api.credentials.describe({ refs: [tokenRef] })
+          if (!res.result.ok) {
+            setFailed(res.result.error.message)
+            return
+          }
+          setInfo(res.result.value.credentials[tokenRef] ?? { configured: false, writable: true })
+        } catch (error) {
+          setFailed(error instanceof Error ? error.message : String(error))
+        }
+      }, [api, tokenRef])
+
+      React.useEffect(() => { void describe() }, [describe])
+
+      /** 存票 / 清票走同一条路：都要收尾（重新 describe + 让外面重查连接状态）。 */
+      const commit = React.useCallback(async (run, ok) => {
+        setBusy(true)
+        setFailed(null)
+        setDone(null)
+        try {
+          const res = await run()
+          if (!res.result.ok) {
+            // 这里最常见的失败是「被环境变量遮蔽」，dsh 的报错原文就写清了该去哪解决，
+            // 所以原样透出，不要包成「保存失败」那种什么都没说的话。
+            setFailed(res.result.error.message)
+            return
+          }
+          setDraft('')
+          setDone(ok)
+          await describe()
+          onChanged()
+        } catch (error) {
+          setFailed(error instanceof Error ? error.message : String(error))
+        } finally {
+          setBusy(false)
+        }
+      }, [describe, onChanged])
+
+      const locked = info !== null && info.writable === false
+      const where = info?.source === undefined ? null : (SOURCES[info.source] ?? info.source)
+
+      return h('div', { className: 'aloof-fab-sec' }, [
+        h('div', { key: 'head', className: 'aloof-fab-sec-head' }, [
+          h('span', { key: 't' }, '凭据'),
+          h('span', { key: 'r', className: 'aloof-fab-src' }, tokenRef),
+        ]),
+
+        // 来源：配了才有意义。没配的时候下面的输入框自己会说该干什么。
+        info?.configured === true
+          ? h(Row, { key: 'src', k: '来自' }, [
+            where,
+            prefix === null ? null : h('span', { key: 'p', className: 'aloof-fab-src' }, `　${prefix}…`),
+          ])
+          : null,
+
+        locked
+          ? // 环境变量那层这个进程改不动（dsh 的 `set()` 直接拒），所以别摆一个按下去必然
+            // 报错的输入框，直接说清真正的解法：去启动 dsh 的那个 shell 里把它 unset。
+            h('div', { key: 'lock', className: 'aloof-fab-note' },
+              `这张票由${where}提供，dsh 改不动它。要换票先在启动 dsh 的那个终端里 `
+              + `unset ${tokenRef}，再重启 dsh，然后回这儿配。`)
+          : [
+            h('input', {
+              key: 'in',
+              className: 'aloof-fab-input',
+              // password：这串东西等于账号，不该被肩后的人、也不该被截图带走
+              type: 'password',
+              autoComplete: 'off',
+              spellCheck: false,
+              placeholder: info?.configured === true ? '已配置——粘贴新的整串可替换' : '粘贴 alf_xxx@https://你那台',
+              value: draft,
+              disabled: busy,
+              onChange: (event) => setDraft(event.target.value),
+              // 粘完直接回车就能存，不用非去点按钮
+              onKeyDown: (event) => {
+                if (event.key === 'Enter' && draft.trim() !== '' && !busy) {
+                  void commit(() => api.credentials.set({ ref: tokenRef, value: draft.trim() }), '换好了')
+                }
+              },
+            }),
+            h('div', { key: 'acts', className: 'aloof-fab-acts' }, [
+              h('button', {
+                key: 'save',
+                className: 'aloof-fab-go',
+                type: 'button',
+                disabled: busy || draft.trim() === '',
+                onClick: () => void commit(
+                  () => api.credentials.set({ ref: tokenRef, value: draft.trim() }), '换好了'),
+              }, busy ? '写着…' : '保存'),
+              info?.configured === true
+                ? h('button', {
+                  key: 'clear',
+                  className: 'aloof-fab-ghost',
+                  type: 'button',
+                  disabled: busy,
+                  onClick: () => void commit(
+                    () => api.credentials.unset({ ref: tokenRef }), '清掉了'),
+                }, '清除')
+                : null,
+            ]),
+            h('div', { key: 'how', className: 'aloof-fab-note' },
+              '在 Aloof 里点左下角自己的名字 → dsh 接入，生成后整串复制（@ 后面那截是地址，别只粘前半截）。'),
+          ],
+
+        failed === null ? null : h('div', { key: 'bad', className: 'aloof-fab-bad' }, failed),
+        done === null ? null : h('div', { key: 'ok', className: 'aloof-fab-ok' }, done),
+      ])
+    }
+
     /** 右下角那颗按钮 + 点开的那张卡。 */
-    function AloofFab() {
+    function AloofFab(props) {
       const [state, setState] = React.useState(null)
       const [open, setOpen] = React.useState(false)
       const [checking, setChecking] = React.useState(false)
+      const [pos, setPos] = React.useState(loadPos)
+      const drag = useDrag(pos, setPos)
 
       const load = React.useCallback((signal) => {
         setChecking(true)
@@ -144,12 +447,53 @@ window.__ModuleLoader__.load({
         }
       }, [load])
 
+      // 窗口缩小之后，存下来的位置可能已经在视口外了。夹一次，别让按钮凭空消失。
+      React.useEffect(() => {
+        const onResize = () => setPos((current) => clampPos(current))
+        window.addEventListener('resize', onResize)
+        return () => window.removeEventListener('resize', onResize)
+      }, [])
+
+      // 票在别处被改了（dsh 的设置页、直接编辑 .credentials.yaml、另一个窗口的这颗按钮）
+      // 也要跟上。宿主把 `credentials/updated` 透到浏览器，正好省掉「靠 30 秒轮询等」。
+      React.useEffect(() => {
+        const remote = props.remote
+        if (remote?.$on === undefined) return undefined
+        return remote.$on('credentials/updated', () => void load())
+      }, [props.remote, load])
+
       const live = state === null ? 'wait' : (state.connected ? 'yes' : 'no')
       const title = state === null
         ? 'Aloof：正在看'
         : (state.connected ? 'Aloof：已连上' : 'Aloof：连不上')
 
-      return h('div', { className: 'aloof-fab' }, [
+      // 卡朝着屏幕中间开，不然拖到顶上 / 左边之后它会开到视口外。
+      const below = pos.bottom > window.innerHeight / 2
+      const side = pos.right > window.innerWidth / 2 ? 'left' : 'right'
+
+      // 每次渲染都夹一遍：窗口尺寸变了、或者存的是上一块屏幕的位置时，这是最后一道兜底。
+      const safe = clampPos(pos)
+
+      /**
+       * **定位的是按钮，不是这一坨。**
+       *
+       * 容器是「卡 + 按钮」的 flex 盒，它的尺寸随卡片开合从 46px 蹦到 400 多。所以哪条边用来
+       * 定位，就得挑**当前贴着按钮的那条**，否则按钮会被卡片顶着走：曾经四个方向都写死
+       * `right`/`bottom`，卡片翻到下方（`column-reverse`）时容器底边变成卡片底边，按钮直接被
+       * 顶出视口外（实测 y = -304，屏幕上找不着）。
+       */
+      const place = {}
+      if (below) place.top = window.innerHeight - safe.bottom - FAB_SIZE
+      else place.bottom = safe.bottom
+      if (side === 'left') place.left = window.innerWidth - safe.right - FAB_SIZE
+      else place.right = safe.right
+
+      return h('div', {
+        className: 'aloof-fab',
+        'data-below': below ? 'yes' : 'no',
+        'data-side': side,
+        style: place,
+      }, [
         open && state !== null ? h('div', { key: 'card', className: 'aloof-fab-card' }, [
           h('div', { key: 'head', className: 'aloof-fab-head' }, [
             h('span', { key: 't' }, title),
@@ -178,6 +522,20 @@ window.__ModuleLoader__.load({
                   '先看上面那个地址对不对——换过环境的话很可能是旧票，再查网络。'),
               ]),
             ],
+
+          // 凭据一栏。**没配票的时候也在**——那时候这才是人真正需要的东西。
+          props.api === null
+            ? h('div', { key: 'no-api', className: 'aloof-fab-note' },
+              `这套装配里没有和宿主通话的通道，改不了票。把 ${state.tokenRef} 写进 `
+              + '$DSH_HOME/.credentials.yaml 或环境变量。')
+            : h(Credentials, {
+              key: 'cred',
+              api: props.api,
+              tokenRef: state.tokenRef,
+              prefix: state.prefix,
+              // 换完票立刻重查连接：绿灯该在按下保存之后就亮，而不是等下一轮轮询。
+              onChanged: () => void load(),
+            }),
         ]) : null,
 
         h('button', {
@@ -185,10 +543,17 @@ window.__ModuleLoader__.load({
           className: 'aloof-fab-btn',
           type: 'button',
           // 折叠着的时候，这个 title 就是「不点开也知道通没通」那条路
-          title,
+          title: `${title}（可拖动）`,
           'aria-label': title,
           'aria-expanded': open,
-          onClick: () => setOpen((v) => !v),
+          'data-dragging': drag.dragging ? 'yes' : 'no',
+          ...drag.handlers,
+          // 开关卡片走 click：鼠标、触屏 tap、键盘 Enter/Space 都会产生它。只把拖拽尾随的
+          // 那次滤掉（见 useDrag 里为什么是时间窗而不是标记）。
+          onClick: () => {
+            if (drag.recentlyDragged()) return
+            setOpen((v) => !v)
+          },
         }, [
           h(Mark, { key: 'm', size: 21 }),
           h('span', { key: 'd', className: 'aloof-fab-dot', 'data-live': live }),
@@ -198,13 +563,33 @@ window.__ModuleLoader__.load({
 
     exports.name = 'dsh-aloof-fab'
 
-    /** `slots` 是唯一要的服务：这半部只往界面上挂东西，票和网络都在 Node 那边。 */
+    /**
+     * `slots` 是**唯一硬性**依赖：挂不上界面这半部就没有存在意义。
+     *
+     * `connection`（凭据读写）和 `remote`（票在别处变了的推送）是**可选**的，用 `ctx.get` 取、
+     * 不写进 `inject`：写进来的话，缺其中任何一个整颗按钮就直接不出现，人看到的是「插件装了
+     * 但什么都没有」，最难查。取不到时按钮照常显示状态，只是凭据那栏换成一句「在这儿改不了、
+     * 去哪儿改」——**能用的部分不该被不能用的部分拖下去**。
+     */
     exports.inject = ['slots']
 
     /**
      * @param {any} ctx 宿主给的（受限）client ctx
      */
     exports.apply = function apply(ctx) {
+      // 凭据走宿主的 `/api` RPC（`connection.api.credentials`），和 dsh 自己的模型设置页同一条路。
+      //
+      // **为什么不自己注册一个 POST 路由收令牌**：`webServer.register` 的路由上没有任何 CSRF /
+      // Origin 检查，而 dsh 就听在 127.0.0.1——那样任何一个恶意网页都能跨源打过来改你的票。
+      // `/api` 那条路上有 `sec-fetch-site` 拒跨站、Origin 同源校验、强制 application/json
+      // （挡住不触发预检的「简单」POST），凭据三个方法还额外钉死 loopback。所以这里绝不另开一条。
+      const connection = ctx.get?.('connection')
+      const api = connection?.api ?? null
+      const remote = ctx.get?.('remote') ?? null
+
+      // 在 apply 里定一次就好：每次渲染都新建一个组件类型的话，React 会把它当成「换了组件」
+      // 而整棵子树重挂，输入框里打了一半的票会被清掉。
+      const Mounted = () => h(AloofFab, { api, remote })
       // `shell.overlay` 是根作用域的 list 槽，铺满整个 shell、默认穿透点击（层自己是
       // `pointer-events:none`，直接子元素才是 `auto`）。所以这颗按钮浮在所有页面之上、
       // 又不挡住下面任何东西——正是常驻状态灯要的位置。
@@ -215,7 +600,7 @@ window.__ModuleLoader__.load({
         name: 'shell.overlay',
         id: 'aloof-status',
         label: 'Aloof',
-      }, AloofFab))
+      }, Mounted))
     }
 
     return module.exports
