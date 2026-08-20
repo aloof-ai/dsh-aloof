@@ -1,0 +1,28 @@
+# 装这个插件时 dsh 会把下面这段并进 profile 的 cordis 配置。
+#
+# **不要改这个文件**——它跟着包走，升级会覆盖。要改就在你自己 profile 的
+# `cordis.patch.yml` 里按 id 覆盖：
+#
+#   - id: aloof
+#     name: 'dsh-aloof'
+#     config:
+#       tokenEnv: ALOOF_TOKEN
+#       timeoutMs: 20000
+#
+# patch 是**整块替换** `config` 而不是深合并，所以覆盖时键要写全。
+#
+# **这里没有 baseUrl，这是故意的。** 地址跟着票一起来——Aloof 复制给你的是
+# `alf_xxxx@https://你那台` 一整串，插件从 @ 切开，前半截当密钥、后半截当地址。
+# 要是这个文件兜一个具体域名，装完没改的人的令牌就会发到那个域名去（那边只会回
+# 401，但票已经出网了）。只有反向代理 / 内网另有入口、网页地址和 dsh 能到达的地址
+# 确实不是同一个时，才在上面那段覆盖里补一行 baseUrl，填了以它为准。
+- insert:
+    - id: aloof
+      name: 'dsh-aloof'
+      config:
+        # 令牌的**引用名**（环境变量名 / credentials 里的键），不是令牌本身。
+        # 令牌的值走 dsh 的 credentials，配置里只留这个名字——这样配置可以随便同步、
+        # 随便渲染到界面上，换令牌也不用碰这个文件。
+        tokenEnv: ALOOF_TOKEN
+        # 单次 HTTP 超时（毫秒）
+        timeoutMs: 20000

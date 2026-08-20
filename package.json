@@ -1,0 +1,33 @@
+{
+  "name": "dsh-aloof",
+  "version": "0.1.0",
+  "private": true,
+  "description": "把 Aloof（企业团队知识协同平台）接成 DeepSeek Harness 的原生工具。这一版只做连通性确认，资料库工具随资料库那一期一起来。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "aloof"
+  ],
+  "license": "MIT",
+  "author": "Aloof",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
