@@ -1,0 +1,10 @@
+node_modules/
+dist/
+
+# 票是密钥，永远不该进版本库
+.env
+.env.*
+*.credentials.yaml
+
+.DS_Store
+*.log
