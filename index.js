@@ -17,7 +17,13 @@
 /** loader 用它做日志和错误定位；和 cordis.patch.yml 里的 `id` 无关。 */
 export const name = 'aloof'
 
-/** 只依赖工具注册表：没有它就不该挂载。 */
+/**
+ * 只**硬**依赖工具注册表：没有它这个插件没有存在意义。
+ *
+ * `commands`（斜杠命令）是**可选**的，所以不写在这儿而是在 apply 里嵌套 inject：写进来的话，
+ * 任何没组合命令服务的装配（无头 demo、ACP 自动化）会让整个插件不挂载——为了一个 `/aloof`
+ * 把两个工具也搭进去，赔本。嵌套之后那种装配里只是没有这条命令。
+ */
 export const inject = ['tools']
 
 /**
@@ -168,8 +174,10 @@ export function apply(ctx, config) {
    * 优先走 dsh 的 credentials 服务（它把进程环境变量叠在 `$DSH_HOME/.credentials.yaml`
    * 之上），这套服务不在时退回读环境变量，让插件在裸装配里也能用。
    *
-   * **每次调用现取，不缓存**——换了票下一次请求就生效（甚至换成另一家公司的实例），
-   * 不用重启 dsh。
+   * **每次调用现取，不缓存**——换了票下一次请求就生效（甚至换成另一家公司的实例）。
+   * 这一层是真的没缓存；dsh 那层盯着 `.credentials.yaml` 热更新（实测 0.5s 内），所以
+   * 改文件不用重启。**但环境变量那份是启动时冻结的，而且压在文件之上**——同名环境变量
+   * 存在时，改文件永远不生效，且现象和「插件缓存了」一模一样。
    */
   async function token() {
     const service = ctx.get?.('credentials')
@@ -187,13 +195,17 @@ export function apply(ctx, config) {
   }
 
   /**
-   * 一次 Aloof API 调用。
-   * @param {'GET'|'POST'|'PATCH'|'PUT'|'DELETE'} method HTTP 方法
-   * @param {string} path 形如 `/api/auth/me`
-   * @param {{query?:Record<string,any>,body?:any,signal?:AbortSignal}} [options] 附加项
+   * 把票解析成「密钥 + 该打哪台 + 认票用的前缀」。
+   *
+   * **单独抽出来是为了「失败时也报得出地址」**：这条链上最贵的一类故障是票指着一台到不了的
+   * 机器（换过环境、留着旧票），此时 fetch 抛的是 `fetch failed`，看起来百分百像网络/证书
+   * 问题，人和模型会一路去查 DNS、代理、TLS，而根因只是地址不对。所以任何面向人的输出都要
+   * 能在**没发出任何请求**的前提下先说出「我打算连哪」。
+   *
+   * @returns {Promise<{secret:string, base:string, prefix:string}>} `prefix` 和后端存的那 10
+   * 位一致（`alf_` + 6），拿来跟网页上的票列表对行，不是密钥。
    */
-  async function api(method, path, options = {}) {
-    // 地址每次现算：票换了下一次请求就打到新的那台，不用重启 dsh。
+  async function resolve() {
     const { secret, carried } = split(await token())
     const base = pinned ?? carried
     if (base === null) {
@@ -206,6 +218,17 @@ export function apply(ctx, config) {
       const from = pinned === null ? `${ref} 里 @ 后面那截` : '配置里的 baseUrl'
       throw new Error(`地址 "${base}" 不像个网址（要带 http:// 或 https://）。它来自${from}`)
     }
+    return { secret, base, prefix: secret.slice(0, 10) }
+  }
+
+  /**
+   * 一次 Aloof API 调用。
+   * @param {'GET'|'POST'|'PATCH'|'PUT'|'DELETE'} method HTTP 方法
+   * @param {string} path 形如 `/api/auth/me`
+   * @param {{query?:Record<string,any>,body?:any,signal?:AbortSignal}} [options] 附加项
+   */
+  async function api(method, path, options = {}) {
+    const { secret, base } = await resolve()
 
     const url = new URL(base + path)
     for (const [key, value] of Object.entries(options.query ?? {})) {
@@ -264,7 +287,7 @@ export function apply(ctx, config) {
         render: (_args, v) => [{
           type: 'text',
           text: `连上了。Aloof 认出你是 ${v.name}（登录名 ${v.username}）`
-            + `${v.isAdmin ? '，管理员' : ''}。`,
+            + `${v.isAdmin ? '，有管理权限' : ''}。`,
         }],
       },
       async execute(_args, exec) {
@@ -316,4 +339,109 @@ export function apply(ctx, config) {
   ]
 
   for (const t of registrations) ctx.tools.register(t)
+
+  /**
+   * 连接状态的**唯一事实来源**，`/aloof` 和界面都读它，保证两处口径一致。
+   *
+   * 关键约束：**返回值里绝不含密钥**。`prefix` 是明文前 10 位（`alf_` + 6），后端自己就是
+   * 这么存的、网页票列表上显示的也是它，用来「认出是哪一张」——够对行，不够冒用。
+   *
+   * 不抛异常：连不上也是一种状态，不是错误。调用方要渲染「连不上 + 为什么」，用异常表达
+   * 会让每个调用方都得写一遍 try/catch 再把 message 抠出来。
+   * @param {AbortSignal} [signal] 调用方的取消信号
+   */
+  async function status(signal) {
+    let where
+    try {
+      where = await resolve()
+    } catch (error) {
+      // 连地址都没解析出来（没配票 / 票不带地址）：这时候连「打算连哪」都说不出。
+      return { connected: false, base: null, prefix: null, tokenRef: ref, user: null,
+        error: error instanceof Error ? error.message : String(error) }
+    }
+    const shape = { base: where.base, prefix: where.prefix, tokenRef: ref }
+    try {
+      const me = await api('GET', '/api/auth/me', { signal })
+      return { connected: true, ...shape, user: me, error: null }
+    } catch (error) {
+      return { connected: false, ...shape, user: null,
+        error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  /**
+   * `GET /dsh-aloof/status` —— 给 dsh 界面用的同源接口。
+   *
+   * **为什么要绕这一道，不让浏览器直连 Aloof**：票在 `$DSH_HOME/.credentials.yaml` 里，是
+   * 服务端的东西。让页面自己去调 Aloof 就得把票发到浏览器，那它就会躺在 devtools、扩展、
+   * 以及任何 XSS 的射程内——而且这张票的权限比页面需要的大得多。这里只把**结论**发给页面。
+   *
+   * 嵌套 inject 同 commands：没有 web 服务的装配（纯 CLI）不该因此整个插件挂不上。
+   */
+  ctx.inject(['webServer'], (scoped) => {
+    scoped.effect(() => scoped.webServer.register({
+      kind: 'exact',
+      path: '/dsh-aloof/status',
+      handler: async (request, response) => {
+        if (request.method !== 'GET') {
+          response.writeHead(405, { allow: 'GET' })
+          response.end()
+          return
+        }
+        const body = JSON.stringify(await status())
+        // no-store：这是「现在通不通」，缓存一份旧的等于骗人。
+        response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+        response.end(body)
+      },
+    }), 'dsh-aloof: status route')
+  })
+
+  /**
+   * `/aloof` —— 给**人**看的连接状态。
+   *
+   * 为什么工具之外还要一条命令：`aloof_whoami` 是给模型的，人要看状态只能开口问，而模型会
+   * 把「连不上」误诊成别的东西（真实发生过：票指着一台到不了的机器，模型一路查到 TLS 证书
+   * 和代理规则，全对，但都不是根因）。这条命令是**确定性的**——同样的输入永远同样的输出，
+   * 不经过模型，也不花 token。
+   *
+   * 挂在嵌套 inject 里：命令服务不在的装配（无头 / ACP）只是没有这条命令，两个工具照常工作。
+   */
+  ctx.inject(['commands'], (scoped) => {
+    scoped.commands.register({
+      name: 'aloof',
+      description: '看这台 dsh 连的是哪个 Aloof、认出我是谁',
+      handler: async (invocation) => {
+        const s = await status(invocation.signal)
+
+        // 地址解析都没过（没配票）：没有地址可报，直接把那句怎么配透出去。
+        if (s.base === null) return { kind: 'error', text: s.error }
+
+        const lines = [`地址　${s.base}`, `用票　${s.prefix}…`]
+        if (s.connected) {
+          return {
+            kind: 'success',
+            text: [
+              'Aloof：已连上',
+              ...lines,
+              // 标记写「有管理权限」而不是「管理员」：显示名本身可能就叫「管理员」（种子账号
+              // 就是），复述一遍读起来像卡碟。说能力则两种名字下都通顺。
+              `身份　${s.user.name}（${s.user.username}）${s.user.isAdmin ? ' · 有管理权限' : ''}`,
+            ].join('\n'),
+          }
+        }
+        return {
+          kind: 'error',
+          text: [
+            'Aloof：连不上',
+            ...lines,
+            `报错　${s.error}`,
+            '',
+            '排查顺序：先看上面那个地址对不对（换过环境的话很可能是旧票），再查网络。',
+            '改 .credentials.yaml 不用重启 dsh（它盯着文件热更新）；'
+            + '要是改了地址还没变，多半有个同名环境变量压着它——那份只有重启才换。',
+          ].join('\n'),
+        }
+      },
+    })
+  })
 }

@@ -1,7 +1,7 @@
 {
   "name": "dsh-aloof",
-  "version": "0.2.0",
-  "description": "把 Aloof（企业团队知识协同平台）接成 DeepSeek Harness 的原生工具：两个只读工具，确认这台 dsh 连到了哪台 Aloof、被认成谁，以及自己名下有哪些接入令牌。",
+  "version": "0.3.0",
+  "description": "把 Aloof（企业团队知识协同平台）接成 DeepSeek Harness 的原生能力：两个只读工具给模型用，/aloof 命令和右下角那颗带红绿灯的悬浮按钮给人看——连的哪台 Aloof、被认成谁、用的哪张票。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -23,11 +23,13 @@
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
+    "client.js",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -35,6 +37,9 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "engines": {
