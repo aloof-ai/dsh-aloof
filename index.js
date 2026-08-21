@@ -1,11 +1,16 @@
 /**
- * Aloof → DeepSeek Harness（dsh）原生工具。
+ * Aloof → DeepSeek Harness（dsh）。**把团队的做事方式装进这台机器的 agent。**
  *
- * **这一版只做「连上」这件事**：两个只读工具，用来确认这台 dsh 真的接到了公司那台 Aloof
- * 上、而且认出了是谁。团队资料库的读写工具跟着资料库那一期一起来。
+ * 干两件事：
  *
- * 写操作到时候会走 dsh 的审批闸门（`ctx.approval`）——模型不能悄悄改团队的东西。现在没有
- * 写工具，所以那段代码也不在这儿：没有调用者的「安全设施」只是让人误以为有防护。
+ * 1. **下发团队上下文**（这份文件里最要紧的部分）。定时拉 Aloof 的 `/api/context`，把
+ *    「红线」塞进系统提示、把「手册」注册进 dsh 的技能目录。管理员在网页上改一句话，这台
+ *    机器上的 agent 下一次对话就照新的来——这是这个产品和「又一个文件柜」的分界线。
+ * 2. **两个只读工具**，确认这台 dsh 真的连上了公司那台 Aloof、而且认出了是谁。
+ *
+ * **写操作一律不在这儿**，尤其不给改规矩的口子：agent 能改自己要遵守的红线的话，红线就
+ * 只是一段可以被绕过的建议。后端那边也挡着（`_TOKEN_WRITES` 是空的 + 端点挂 `human_admin`），
+ * 两边都挡是刻意的。将来真要让 AI 参与，正确形状是「它提议、人过目」。
  *
  * 为什么整份文件没有一句 import：
  * dsh 的 `defineTool` / `credentialRef` 这些都在 `@deepseek-ai/dsh-*` 包里，用了就把插件
@@ -36,7 +41,23 @@ export const inject = ['tools']
 const DEFAULTS = {
   tokenEnv: 'ALOOF_TOKEN',
   timeoutMs: 20000,
+  /**
+   * 多久去 Aloof 拉一次团队上下文。
+   *
+   * 五分钟是「改一句话多久生效」和「别把服务器当心跳靶子」之间的取舍。往下调没什么意义：
+   * 真要秒级生效该做的是服务端推送，不是把轮询调密。
+   */
+  syncEveryMs: 300000,
 }
+
+/**
+ * 团队红线在系统提示里的位置。
+ *
+ * dsh 的约定：`-100` 是 harness 自己的身份，`0` 是部署方的人格，`100`~`199` 是工具指引。
+ * 团队规矩排在人格**之后**、工具指引之前——先知道「你是谁」，再知道「你在这个团队要守
+ * 什么」，然后才是「手上有哪些工具」。
+ */
+const RULES_ORDER = 50
 
 /** 凭据引用名的合法形状，和 dsh 的 `credentialRef` 一致（POSIX 标识符）。 */
 const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -148,6 +169,35 @@ function when(iso) {
 
 /** 一个开放对象的 schema，用于把后端返回原样透给模型。 */
 const OPEN_OBJECT = { type: 'object', additionalProperties: true }
+
+/**
+ * 「下发了什么」这一行给人看的形状。
+ *
+ * 这一行要能分开三件不同的事，因为它们各自对应不同的下一步：
+ *
+ * - **从没拉到过**：去查连接（票 / 网络）。
+ * - **拉到了但是空的**：去网页上写规矩——连接是好的，只是没人配过。这一种最容易被误读成
+ *   「插件没生效」，所以必须说出来。
+ * - **拉到过、最近一次失败了**：现在按旧内容跑，不用慌，但 Aloof 那边有问题。
+ * @param {{revision:string|null,ruleCount:number,ruleChars:number,skills:string[],
+ *   syncedAt:string|null,error:string|null}} team 下发状态
+ */
+function delivery(team) {
+  if (team.revision === null) {
+    return team.error === null ? '还没拉到（正在同步）' : `拉不到团队上下文：${team.error}`
+  }
+
+  const parts = []
+  if (team.ruleCount > 0) parts.push(`${team.ruleCount} 条红线（约 ${team.ruleChars} 字）`)
+  if (team.skills.length > 0) parts.push(`${team.skills.length} 份手册：${team.skills.join('、')}`)
+  const what = parts.length === 0
+    ? '连上了，但团队还没配任何规矩（去 Aloof 网页上加）'
+    : parts.join(' · ')
+
+  return team.error === null
+    ? what
+    : `${what}　⚠ 最近一次同步失败，按 ${when(team.syncedAt)} 的内容在跑：${team.error}`
+}
 
 export function apply(ctx, config) {
   const conf = { ...DEFAULTS, ...(config ?? {}) }
@@ -274,6 +324,169 @@ export function apply(ctx, config) {
     return text === '' ? null : JSON.parse(text)
   }
 
+  /**
+   * 团队上下文的本地副本。**这台机器上唯一的一份**：系统提示、技能目录、`/aloof`、界面
+   * 都读它，所以「agent 看到的」和「界面上说的」不可能对不上。
+   */
+  const team = {
+    /** 服务端算的内容指纹。`null` = 还没成功拉到过。 */
+    revision: null,
+    /** 拼好的红线，直接进系统提示。 */
+    rules: '',
+    ruleCount: 0,
+    ruleChars: 0,
+    /** `[{ name, description, body }]`，注册进技能目录。 */
+    skills: [],
+    syncedAt: null,
+    error: null,
+  }
+
+  /** 内容真的换了之后要重注册技能的人（红线不用，见下面 `text` 是个函数）。 */
+  const watchers = new Set()
+
+  /**
+   * 去 Aloof 拉一次团队上下文。
+   *
+   * **拉不到就保持上一次的内容**，不清空、不抛。两个理由：
+   *
+   * - 网络抖动和服务重启是最常见的失败，而红线绝大多数是「不许做什么」。清空等于在
+   *   Aloof 不可用的这段时间里把 agent 的约束全撤了——那比按一份稍旧的规矩走危险得多。
+   * - 一个团队规矩服务挂掉不该让全公司的 agent 停摆。这条链上任何一环都不该是硬依赖。
+   *
+   * @param {AbortSignal} [signal] 调用方的取消信号
+   * @returns {Promise<boolean>} 内容是否真的变了（变了才值得重注册）
+   */
+  async function sync(signal) {
+    let body
+    try {
+      body = await api('GET', '/api/context', { signal })
+    } catch (error) {
+      const why = error instanceof Error ? error.message : String(error)
+      // **只在状态翻转时吵一次**：持续失败（比如压根没配票）刷满日志之后，人就不看日志了，
+      // 于是真正的那一次翻转也被埋掉。稳定的坏状态由 `/aloof` 和界面上的红灯负责显示。
+      if (team.error === null) ctx.logger?.warn?.(`拉团队上下文失败，先按上一次的走：${why}`)
+      else ctx.logger?.debug?.(`拉团队上下文仍然失败：${why}`)
+      team.error = why
+      return false
+    }
+
+    const recovered = team.error !== null
+    team.error = null
+    team.syncedAt = new Date().toISOString()
+    if (recovered) ctx.logger?.info?.('团队上下文恢复同步')
+
+    if (body.revision === team.revision) return false
+    team.revision = body.revision
+    team.rules = typeof body.rules === 'string' ? body.rules : ''
+    team.ruleCount = Number(body.ruleCount) || 0
+    team.ruleChars = Number(body.ruleChars) || 0
+    team.skills = Array.isArray(body.skills) ? body.skills : []
+    for (const watch of watchers) watch()
+    return true
+  }
+
+  /**
+   * 轮询。挂在顶层（不 inject 任何服务）：不管这套装配有没有系统提示和技能目录，
+   * 「现在连的是哪台、下发了什么」都该是能回答的。
+   *
+   * **失败要快速退避重试，不能等下一个整轮**——这条是实跑出来的，不是预防性设计：
+   * 插件 apply 时立刻拉一次，而那一刻 dsh 的 credentials 服务往往还没把票加载好，于是
+   * 第一次必然报「没配 ALOOF_TOKEN」。固定五分钟间隔的话，**每次开机后前五分钟都没有团队
+   * 规矩**，而 `/aloof` 会理直气壮地说「已连上」（那是另一条即时请求的结论）——一个看起来
+   * 一切正常、实际规矩没生效的窗口，最难查的形状。
+   *
+   * 退避同时覆盖了另一件事：Aloof 短暂不可用时不必等满一轮才恢复。5s 起步、每次翻倍、
+   * 封顶在正常间隔——恢复得够快，又不会在长时间故障时变成对服务器的重试风暴。
+   */
+  ctx.effect(() => {
+    const every = Number(conf.syncEveryMs)
+    let timer = null
+    let backoff = 0
+
+    const schedule = (ms) => {
+      timer = setTimeout(tick, ms)
+      // 不让这个定时器把进程钉住（CLI 一次性跑完就该退出）
+      timer.unref?.()
+    }
+
+    async function tick() {
+      await sync()
+      if (team.error === null) backoff = 0
+      else backoff = backoff === 0 ? 5000 : Math.min(backoff * 2, every)
+      schedule(backoff === 0 ? every : backoff)
+    }
+
+    void tick()
+    return () => clearTimeout(timer)
+  }, 'dsh-aloof: 团队上下文同步')
+
+  // 换票（甚至换成另一家公司的实例）之后立刻重拉，不用等下一轮。
+  // 换票是**人刚刚做完的动作**，他会马上去看有没有生效——让他等五分钟等于让他以为没成功。
+  ctx.on?.('credentials/updated', (changed) => {
+    if (changed === ref) void sync()
+  })
+
+  /**
+   * 红线 → 系统提示。
+   *
+   * `text` 给的是**函数**而不是字符串，所以内容更新时**不用重新注册**：每次组装提示词时
+   * 现读 `team.rules`。注册一次、活到插件卸载，没有「注册/注销之间那一瞬间规矩是空的」
+   * 这种缝。
+   *
+   * 还没拉到时它是空串——dsh 组装时会把空 section 丢掉，所以不会在提示词里留一个空标题。
+   */
+  ctx.inject(['systemPrompt'], (scoped) => {
+    scoped.effect(() => scoped.systemPrompt.section({
+      name: 'aloof:team-rules',
+      order: RULES_ORDER,
+      text: () => team.rules,
+    }), 'dsh-aloof: 团队红线')
+  })
+
+  /**
+   * 手册 → 技能目录。
+   *
+   * 同名时谁赢：`skills.register()` 一律给 rank 250（dsh 的 `RUNTIME_RANK`，小的赢），
+   * 文件系统那边是 项目 `.dsh/skills` 100 / 项目 `AGENTS.md` 旁 200 / 自定义根 300 /
+   * `~/.dsh/skills` 400 / bundled 600。所以我们正好卡在「项目的赢过公司的、公司的赢过个人的」，
+   * 这正是想要的位置——但**不是我们选的**：rank 由 register() 写死，插件传什么都改不了。
+   *
+   * 和红线不同，这里**必须重注册**：技能是一个列表，条目会增减，没法用「一个函数每次现读」
+   * 表达。所以订阅内容变化，变了就整批换掉。
+   */
+  ctx.inject(['skills'], (scoped) => {
+    let live = []
+    const drop = () => {
+      for (const dispose of live) dispose()
+      live = []
+    }
+    const put = () => {
+      drop()
+      live = team.skills.map((s) => scoped.skills.register({
+        name: s.name,
+        description: s.description,
+        // dsh 那边这个字段叫 `content`，我们的接口叫 `body`。映射只在这一行，
+        // 后端不跟着下游改名——不然将来接第二种 agent 又要改一次。
+        content: s.body,
+        // source 是**出处标签**（dsh 自带的是 `project-dsh`/`user-dsh`/`bundled` 这类），
+        // 只影响日志和展示、不影响优先级。写 `aloof` 是为了同名被顶掉时那句 warning
+        // 能直接读成「来自 aloof 的手册被更高优先级的顶掉了」
+        source: 'aloof',
+        // 让 `/skills` 列表里看得出这份手册是公司下发的，不是自己写的
+        provider: 'aloof',
+      }))
+    }
+
+    scoped.effect(() => {
+      put()
+      watchers.add(put)
+      return () => {
+        watchers.delete(put)
+        drop()
+      }
+    }, 'dsh-aloof: 团队手册')
+  })
+
   const registrations = [
     tool({
       name: 'aloof_whoami',
@@ -351,15 +564,27 @@ export function apply(ctx, config) {
    * @param {AbortSignal} [signal] 调用方的取消信号
    */
   async function status(signal) {
+    // 下发状态也报出来。**连上了不等于下发成功**：票是好的、但一条规矩都没配，或者
+    // 上一次拉取失败正在按旧内容跑——这两种都要分得出来，不然「为什么 agent 没照规矩来」
+    // 只能靠猜。
+    const delivered = {
+      revision: team.revision,
+      ruleCount: team.ruleCount,
+      ruleChars: team.ruleChars,
+      skills: team.skills.map((s) => s.name),
+      syncedAt: team.syncedAt,
+      error: team.error,
+    }
+
     let where
     try {
       where = await resolve()
     } catch (error) {
       // 连地址都没解析出来（没配票 / 票不带地址）：这时候连「打算连哪」都说不出。
       return { connected: false, base: null, prefix: null, tokenRef: ref, user: null,
-        error: error instanceof Error ? error.message : String(error) }
+        team: delivered, error: error instanceof Error ? error.message : String(error) }
     }
-    const shape = { base: where.base, prefix: where.prefix, tokenRef: ref }
+    const shape = { base: where.base, prefix: where.prefix, tokenRef: ref, team: delivered }
     try {
       const me = await api('GET', '/api/auth/me', { signal })
       return { connected: true, ...shape, user: me, error: null }
@@ -409,7 +634,7 @@ export function apply(ctx, config) {
   ctx.inject(['commands'], (scoped) => {
     scoped.commands.register({
       name: 'aloof',
-      description: '看这台 dsh 连的是哪个 Aloof、认出我是谁',
+      description: '看这台 dsh 连的是哪个 Aloof、认出我是谁、下发了哪些团队规矩',
       handler: async (invocation) => {
         const s = await status(invocation.signal)
 
@@ -426,6 +651,7 @@ export function apply(ctx, config) {
               // 标记写「有管理权限」而不是「管理员」：显示名本身可能就叫「管理员」（种子账号
               // 就是），复述一遍读起来像卡碟。说能力则两种名字下都通顺。
               `身份　${s.user.name}（${s.user.username}）${s.user.isAdmin ? ' · 有管理权限' : ''}`,
+              `下发　${delivery(s.team)}`,
             ].join('\n'),
           }
         }
@@ -435,6 +661,10 @@ export function apply(ctx, config) {
             'Aloof：连不上',
             ...lines,
             `报错　${s.error}`,
+            // 连不上时也报下发状态。**「连不上」不等于「规矩没了」**：上一次拉到的内容还在
+            // 生效（刻意的——红线多半是「不许做什么」，Aloof 一挂就把约束全撤了更危险）。
+            // 不说这一句，人会以为这段时间 agent 是完全放开的。
+            `下发　${delivery(s.team)}`,
             '',
             '排查顺序：先看上面那个地址对不对（换过环境的话很可能是旧票），再查网络。',
             '改 .credentials.yaml 不用重启 dsh（它盯着文件热更新）；'

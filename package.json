@@ -1,7 +1,7 @@
 {
   "name": "dsh-aloof",
-  "version": "0.4.0",
-  "description": "把 Aloof（企业团队知识协同平台）接成 DeepSeek Harness 的原生能力：两个只读工具给模型用，/aloof 命令和右下角那颗可拖动、带红绿灯的悬浮按钮给人看——连的哪台 Aloof、被认成谁、用的哪张票，接入令牌也能直接在那儿换。",
+  "version": "0.5.0",
+  "description": "把团队的做事方式装进这台机器的 agent：从 Aloof 同步团队红线（进系统提示）和团队手册（进技能目录），管理员在网页上改一句话，这台 dsh 下一次对话就照新的来。外加 /aloof 命令和右下角那颗可拖动、带红绿灯的悬浮按钮——连的哪台 Aloof、被认成谁、下发了什么，接入令牌也能直接在那儿换。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -21,6 +21,9 @@
   },
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
