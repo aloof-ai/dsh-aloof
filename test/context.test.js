@@ -111,6 +111,7 @@ function harness(respond) {
       method: init.method ?? 'GET',
       path: new URL(String(url)).pathname,
       body: init.body === undefined ? null : JSON.parse(init.body),
+      headers: init.headers ?? {},
     })
     const body = respond(String(url), init)
     return {
@@ -227,6 +228,40 @@ describe('团队上下文下发', () => {
     // 那比按一份稍旧的规矩走危险得多。
     assert.match(rules.text(), /客户数据不外发/)
     assert.equal(h.skills.length, 1)
+
+    h.stop()
+  })
+
+  /**
+   * 把「我这台在用哪一版」报回服务端。
+   *
+   * 这条链上最危险的失效形态是**静默**：接口 200、界面显示已连接、`/aloof` 一切正常，而规矩
+   * 压根没进模型的上下文。管理员在浏览器里唯一能看到的就是自己写下的字——除非机器自己报账。
+   *
+   * 所以这个头一旦丢了，症状是「Aloof 那边显示所有人都从没同步过」，而插件这边完全正常，
+   * 没有任何报错。测试盯住它，因为它是那种删掉之后测试仍然全绿的东西。
+   */
+  it('每个请求都带上这台机器当下在用的那一版指纹', async () => {
+    let current = payload()
+    const h = harness(() => current)
+    await settle()
+
+    // 第一次拉的时候本地还没有任何内容，不该凭空报一个版本
+    assert.equal(
+      h.calls[0].headers['x-aloof-revision'],
+      undefined,
+      '还没拉到过内容时不该带这个头——报一个假版本比不报更糟',
+    )
+
+    current = payload({ revision: 'rev-2' })
+    await h.touch()
+
+    // 第二次请求发出时，这台机器手里的是第一次拿到的那一版
+    assert.equal(h.calls[1].headers['x-aloof-revision'], 'rev-1')
+
+    await h.touch()
+    // 现在换成了新的那一版
+    assert.equal(h.calls[2].headers['x-aloof-revision'], 'rev-2')
 
     h.stop()
   })

@@ -321,6 +321,14 @@ export function apply(ctx, config) {
         signal,
         headers: {
           authorization: `Bearer ${secret}`,
+          // 报一句「我这台现在活着用的是哪一版规矩」。**它是这台机器自己的账**，和服务端
+          // 「我发过哪一版」不是一回事——后者在静默失效时（拿到了内容但注册技能抛了）
+          // 一片绿，而管理员在浏览器里只能看到自己写下的字。所以带上它，让他那边能看出
+          // 「写完了，但有两台还没跟上」。
+          //
+          // 挂在 `api()` 而不是只挂在 sync 上：每个请求都带一次，所以就算某台机器很久
+          // 不同步（比如一直失败），只要它还在调别的接口，服务端就知道它卡在哪一版。
+          ...(team.revision === null ? {} : { 'x-aloof-revision': team.revision }),
           ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
         },
         ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
