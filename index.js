@@ -199,6 +199,26 @@ function delivery(team) {
     : `${what}　⚠ 最近一次同步失败，按 ${when(team.syncedAt)} 的内容在跑：${team.error}`
 }
 
+/**
+ * 「待确认」那一行，没有就不显示这一行。
+ *
+ * 管理员和普通人关心的不是同一个数：**管理员要知道有几条等着他动手**，普通人只关心
+ * 自己交上去的那条批了没。给他看「全公司有 7 条待确认」只会让他以为自己该做点什么。
+ * @param {{pending:number, minePending:number}|null} counts 后端给的两个数
+ * @param {boolean} isAdmin 这个人能不能批
+ * @returns {string[]} 0 或 1 行，直接展开进输出
+ */
+function waiting(counts, isAdmin) {
+  if (counts === null) return []
+  if (isAdmin && counts.pending > 0) {
+    return [`待确认　${counts.pending} 条团队提案等你过目（去 Aloof 网页上接受或拒绝）`]
+  }
+  if (counts.minePending > 0) {
+    return [`待确认　你交回的 ${counts.minePending} 条还在等管理员确认，暂未下发`]
+  }
+  return []
+}
+
 export function apply(ctx, config) {
   const conf = { ...DEFAULTS, ...(config ?? {}) }
 
@@ -549,6 +569,96 @@ export function apply(ctx, config) {
         return page(body, limit)
       },
     }),
+
+    /**
+     * 把知识交回团队。**这是这个插件里唯一的写操作。**
+     *
+     * 为什么允许模型写：值得沉淀的东西恰好是「谁撞上问题谁才知道」，而那个人知道的那一刻
+     * 正在会话里干活。要求他打开浏览器、登录、再把刚才那段重写一遍——这件事就不会发生。
+     *
+     * 为什么这么写是安全的：**提上去的东西不生效**。后端落在提案表里等真人管理员接受，
+     * 接受那个端点拿令牌调是 403。所以模型能贡献知识，但改不动自己要遵守的红线。
+     * （后端 `core/deps.py` 的写白名单里只有这一条，就是为了这个形状。）
+     *
+     * 描述里那句「用户明确要求时才用」很重要：不写的话模型会在每次帮人解决完问题后热情地
+     * 提一条，而审的人很快就不看待确认列表了——那时这条路就废了。
+     */
+    tool({
+      name: 'aloof_contribute',
+      description:
+        '把一份做法/踩过的坑交回公司的 Aloof，让团队里其他人的 agent 也能用上。'
+        + '\n\n**只在用户明确要求时才调用**——他说「把这个存成团队手册 / 记到团队里 /'
+        + '分享给大家 / 以后都按这个来」之类的话。不要主动替他决定该沉淀什么：'
+        + '提得太多，审的人就不看了。'
+        + '\n\n**交上去不会立刻生效**，它进的是待确认列表，要公司管理员在 Aloof 网页上'
+        + '接受之后，才会下发到团队每个人的 agent。所以复述结果时说「已提交给团队审核」，'
+        + '别说「已经加好了」。'
+        + '\n\n两类别搞混：`skill`（手册）是「要做某件事时照着办」的步骤，按需加载，'
+        + '写多长都行——绝大多数贡献都是这一类。`rule`（红线）是「所有人任何时候都不许/'
+        + '必须」的硬约束，它每次请求都会塞进系统提示，所以只有真正全局的约束才配得上，'
+        + '而且要短。拿不准就用 `skill`。',
+      parameters: {
+        kind: {
+          type: 'string',
+          enum: ['skill', 'rule'],
+          description: '`skill` = 手册（按需加载的做法，默认选它）；`rule` = 红线（全局硬约束，要短）',
+        },
+        name: {
+          type: 'string',
+          description:
+            '稳定标识，**必须是 kebab-case**（小写字母数字加连字符，如 `weekly-report`）。'
+            + '**如果团队里已经有同名的一份，这次就是「修改」那一份**——'
+            + '想补充现有手册就用它现在的名字（你在技能目录里看到的那个名字）。',
+        },
+        title: { type: 'string', description: '给人看的标题，如「周报怎么写」' },
+        description: {
+          type: 'string',
+          description:
+            '**什么时候该用这份手册**（手册必填）。团队里其他人的 agent 全靠这一句决定'
+            + '要不要读正文，所以要写触发场景（「写周报、月报或任何进度汇报时用」），'
+            + '不要写成内容摘要。',
+        },
+        body: { type: 'string', description: '正文（markdown）。手册就是那份步骤本身' },
+        rationale: {
+          type: 'string',
+          description:
+            '**为什么提这一条**（必填）。审的人靠它判断，写清楚来由（「上周三个人各写一套'
+            + '周报格式，对不上」）比复述内容有用。',
+        },
+      },
+      output: {
+        schema: OPEN_OBJECT,
+        // 直接用后端那句话，不在这儿另写一遍。两处各写一份的话，「还没生效」这个最要紧的
+        // 信息迟早有一处会被改丢。
+        render: (_args, v) => [{ type: 'text', text: v.message }],
+      },
+      async execute(args, exec) {
+        for (const key of ['kind', 'name', 'title', 'body', 'rationale']) {
+          if (typeof args[key] !== 'string' || args[key].trim() === '') {
+            throw new Error(`参数 ${key} 不能为空`)
+          }
+        }
+        // kebab-case 在后端也拦（422），但那句报错是给人看的。在这儿先拦一次，模型能当场
+        // 改对重试，不用往返一趟。
+        if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(args.name)) {
+          throw new Error(
+            `name "${args.name}" 不是 kebab-case：只能小写字母、数字和连字符，`
+            + `比如 ${args.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'weekly-report'}`,
+          )
+        }
+        return await api('POST', '/api/context/proposals', {
+          body: {
+            kind: args.kind === 'rule' ? 'rule' : 'skill',
+            name: args.name,
+            title: args.title,
+            description: args.description ?? null,
+            body: args.body,
+            rationale: args.rationale,
+          },
+          signal: exec.signal,
+        })
+      },
+    }),
   ]
 
   for (const t of registrations) ctx.tools.register(t)
@@ -587,10 +697,28 @@ export function apply(ctx, config) {
     const shape = { base: where.base, prefix: where.prefix, tokenRef: ref, team: delivered }
     try {
       const me = await api('GET', '/api/auth/me', { signal })
-      return { connected: true, ...shape, user: me, error: null }
+      return { connected: true, ...shape, user: me, proposals: await proposals(signal), error: null }
     } catch (error) {
-      return { connected: false, ...shape, user: null,
+      return { connected: false, ...shape, user: null, proposals: null,
         error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  /**
+   * 「有几条还在等人确认」。**失败就当没有，不影响状态**。
+   *
+   * 这个数字负责闭掉贡献那个环：交完一条之后人想知道批了没，没有它他只能去开网页——
+   * 而如果他得开网页才能知道结果，那「就地贡献」省下的那点摩擦又还回去了。
+   *
+   * 容错到 `null` 是刻意的：对着一台**旧版 Aloof**（还没有提案功能）这里是 404，那时该显示的
+   * 是「连上了」而不是「连不上」。让一个附加信息的缺失把主状态判成故障，是很常见的自伤。
+   * @param {AbortSignal} [signal] 调用方的取消信号
+   */
+  async function proposals(signal) {
+    try {
+      return await api('GET', '/api/context/proposals/count', { signal })
+    } catch {
+      return null
     }
   }
 
@@ -652,6 +780,7 @@ export function apply(ctx, config) {
               // 就是），复述一遍读起来像卡碟。说能力则两种名字下都通顺。
               `身份　${s.user.name}（${s.user.username}）${s.user.isAdmin ? ' · 有管理权限' : ''}`,
               `下发　${delivery(s.team)}`,
+              ...waiting(s.proposals, s.user.isAdmin),
             ].join('\n'),
           }
         }

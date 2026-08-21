@@ -51,6 +51,9 @@ async function settle() {
 function harness(respond) {
   const sections = []
   const skills = []
+  const tools = new Map()
+  /** 插件实际发出去的请求，用来断言「提案是 POST 到提案端点、而不是直接写资产」。 */
+  const calls = []
   /** 每次 `skills.register` 的 disposer 被调用就记一笔，用来断言「有没有重注册」。 */
   const disposed = []
   const listeners = new Map()
@@ -81,7 +84,12 @@ function harness(respond) {
         }
       },
     },
-    tools: { register: () => {} },
+    tools: {
+      register(t) {
+        tools.set(t.name, t)
+        return () => {}
+      },
+    },
     commands: { register: () => {} },
     webServer: { register: () => () => {} },
   }
@@ -98,8 +106,13 @@ function harness(respond) {
   }
 
   const realFetch = globalThis.fetch
-  globalThis.fetch = async (url) => {
-    const body = respond(String(url))
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      method: init.method ?? 'GET',
+      path: new URL(String(url)).pathname,
+      body: init.body === undefined ? null : JSON.parse(init.body),
+    })
+    const body = respond(String(url), init)
     return {
       ok: true,
       status: 200,
@@ -113,6 +126,16 @@ function harness(respond) {
     sections,
     skills,
     disposed,
+    tools,
+    calls,
+    /** 调一个工具，拿到 `{ result, text }`（text 是渲染给人看的那段）。 */
+    async call(name, args) {
+      const t = tools.get(name)
+      assert.ok(t, `没注册 ${name} 这个工具`)
+      const result = await t.execute(args, { signal: undefined })
+      const rendered = t.output.render(args, result)
+      return { result, text: rendered.map((p) => p.text).join('\n') }
+    },
     /** 模拟「人换了票」，插件应当立刻重新拉一次。 */
     async touch() {
       listeners.get('credentials/updated')?.('ALOOF_TOKEN')
@@ -204,6 +227,107 @@ describe('团队上下文下发', () => {
     // 那比按一份稍旧的规矩走危险得多。
     assert.match(rules.text(), /客户数据不外发/)
     assert.equal(h.skills.length, 1)
+
+    h.stop()
+  })
+})
+
+/**
+ * 交回团队（`aloof_contribute`）。
+ *
+ * 这一组测的其实是**一条安全论证的两端**：允许模型写，唯一的前提是它写的东西不生效。
+ * 所以这里盯死两件事——
+ *
+ * 1. 请求只能打到**提案**端点。哪天有人图省事改成直接 `POST /context/assets`（后端会 403，
+ *    但如果那天白名单也被顺手放开了就不会），模型就能改自己要遵守的红线了。
+ * 2. 回给用户的那句话里必须有「还没生效」。少了它，模型会宣布「已经加好了」，人就不会去
+ *    点确认——于是这条知识永远躺在待确认列表里，而所有人都以为它生效了。
+ */
+describe('交回团队', () => {
+  const SUBMITTED = {
+    id: 7,
+    status: 'pending',
+    isEdit: false,
+    message: '已提交给团队审核：新增手册「周报怎么写」。现在还**没有生效**，管理员接受之后才会下发。',
+  }
+
+  const GOOD = {
+    kind: 'skill',
+    name: 'weekly-report',
+    title: '周报怎么写',
+    description: '写周报、月报或任何进度汇报时用',
+    body: '# 周报\n三段。',
+    rationale: '上周三个人各写一套格式',
+  }
+
+  function aloof(url) {
+    if (url.includes('/api/context/proposals')) return SUBMITTED
+    return payload()
+  }
+
+  it('提案打到提案端点，不碰生效的那份', async () => {
+    const h = harness(aloof)
+    await settle()
+    h.calls.length = 0
+
+    await h.call('aloof_contribute', GOOD)
+
+    assert.equal(h.calls.length, 1)
+    assert.equal(h.calls[0].method, 'POST')
+    // **只能是这个路径**。改成 /api/context/assets 就等于把红线的写权限交给模型了。
+    assert.equal(h.calls[0].path, '/api/context/proposals')
+    assert.deepEqual(h.calls[0].body, GOOD)
+
+    h.stop()
+  })
+
+  it('回给人的话里必须说清还没生效', async () => {
+    const h = harness(aloof)
+    await settle()
+
+    const { text } = await h.call('aloof_contribute', GOOD)
+    // 直接透后端那句，不在插件里另写一份——两处各写一遍，这个最要紧的信息迟早有一处被改丢
+    assert.equal(text, SUBMITTED.message)
+    assert.match(text, /没有生效/)
+
+    h.stop()
+  })
+
+  it('名字不合规当场拦下并给出改法，不白跑一趟后端', async () => {
+    const h = harness(aloof)
+    await settle()
+    h.calls.length = 0
+
+    await assert.rejects(
+      () => h.call('aloof_contribute', { ...GOOD, name: 'Weekly_Report' }),
+      // 报错里要带一个能直接用的名字，否则模型只会把同样的东西再试一遍
+      /weekly-report/,
+    )
+    assert.deepEqual(h.calls, [], '本地就该拦住，不该发请求')
+
+    h.stop()
+  })
+
+  it('必填项空着不发请求', async () => {
+    const h = harness(aloof)
+    await settle()
+    h.calls.length = 0
+
+    await assert.rejects(() => h.call('aloof_contribute', { ...GOOD, rationale: '  ' }), /rationale/)
+    assert.deepEqual(h.calls, [])
+
+    h.stop()
+  })
+
+  it('工具说明必须写明「只在用户明确要求时才用」', async () => {
+    const h = harness(aloof)
+    await settle()
+
+    const description = h.tools.get('aloof_contribute').description
+    // 不写这句的话模型会在每次帮人解决完问题后热情地提一条，审的人很快就不看待确认列表了
+    assert.match(description, /只在用户明确要求时才调用/)
+    // 也必须告诉它别宣布「已经加好了」
+    assert.match(description, /不会立刻生效/)
 
     h.stop()
   })
